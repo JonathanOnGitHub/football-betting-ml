@@ -12,7 +12,7 @@ SEP = "=" * 60
 DATA = Path.home() / '.cache/kagglehub/datasets/austro/beat-the-bookie-worldwide-football-dataset/versions/2'
 OUT = Path('/home/burley/football-ml')
 
-BANKROLL = 10000
+BANKROLL = 1000
 STAKE_FRAC = 0.02
 MIN_EDGE = 5.0
 MIN_ODDS = 1.3
