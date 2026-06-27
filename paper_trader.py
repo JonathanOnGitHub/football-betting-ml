@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Paper Trader — Opening Odds Consensus Strategy (first-seen tracking)
-====================================================================
+Paper Trader — Pre-Match Consensus Strategy (first-seen tracking)
+================================================================
 Simulates value betting against live odds from The Odds API.
 Uses FIRST-SEEN odds only (cached) to match the validated back-test approach.
+Optimised: edge ≥8%, odds 1.3-2.5, £10 flat stake.
 
 Strategy:
   - When a match first appears in the API, record all bookmaker odds = "opening odds"
@@ -33,9 +34,9 @@ import statistics
 # ── Config ──
 BANKROLL = 1000.0
 STAKE_FRAC = 0.02
-MIN_EDGE_PCT = 5.0
+MIN_EDGE_PCT = 8.0
 MIN_ODDS = 1.3
-MAX_ODDS = 2.0
+MAX_ODDS = 2.5
 MIN_BOOKMAKERS = 3
 POLL_INTERVAL = 600
 
