@@ -29,7 +29,7 @@ OUT = Path('/home/burley/football-ml')
 OUT.mkdir(exist_ok=True)
 
 # ── Config ──────────────────────────────────────────────────────────
-BANKROLL = 10000
+BANKROLL = 1000
 STAKE_FRAC = 0.02        # 2% of bankroll per bet
 MIN_EDGE_PCT = 5.0       # Minimum edge over consensus
 MIN_ODDS = 1.3           
