@@ -3,6 +3,8 @@
 *.db
 *.sqlite
 *.gz
+*.log
+*.json
 __pycache__/
 *.pyc
 .DS_Store
