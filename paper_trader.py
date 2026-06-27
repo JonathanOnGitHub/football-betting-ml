@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """
-Paper Trader — Opening Odds Consensus Strategy
-================================================
+Paper Trader — Opening Odds Consensus Strategy (first-seen tracking)
+====================================================================
 Simulates value betting against live odds from The Odds API.
-Uses web search (via agent) to auto-settle match results.
+Uses FIRST-SEEN odds only (cached) to match the validated back-test approach.
 
-Strategy (validated on 10yr historical data):
-  - Opening odds consensus: if a bookmaker's odds are 5%+ above
-    consensus in the 1.3-2.0 range, simulate a 2% bankroll bet.
+Strategy:
+  - When a match first appears in the API, record all bookmaker odds = "opening odds"
+  - For value detection: use ONLY the first-seen odds (never re-scan)
+  - Auto-settle via The Odds API /scores endpoint
+  - Agent can manually settle via web search if needed
 
 Usage:
-  python3 paper_trader.py              # one-shot poll + settle via API
-  python3 paper_trader.py --watch       # continuous loop (every 10 min)
-  python3 paper_trader.py --report      # show portfolio + pending results
+  python3 paper_trader.py              # one-shot poll + settle
+  python3 paper_trader.py --watch       # continuous loop
+  python3 paper_trader.py --report      # portfolio + pending results
   python3 paper_trader.py --settle <home> <away> <hscore> <ascore>
-                                         # manually settle a trade
+  python3 paper_trader.py --odds-cache  # show cached opening odds
 
 Requires: ODDS_API_KEY env var
 """
@@ -41,6 +43,7 @@ OUT_DIR = Path('/home/burley/football-ml')
 OUT_DIR.mkdir(exist_ok=True)
 TRADE_LOG = OUT_DIR / 'paper_trades.csv'
 PORTFOLIO_FILE = OUT_DIR / 'paper_portfolio.json'
+ODDS_CACHE_FILE = OUT_DIR / 'first_seen_odds.json'
 SEP = "=" * 60
 
 
@@ -63,6 +66,104 @@ class PaperTrade:
     won: Optional[bool] = None
     profit: Optional[float] = None
     settled: bool = False
+
+
+# ═══════════════════════════════════════════════════════════════════
+# FIRST-SEEN ODDS CACHE
+# ═══════════════════════════════════════════════════════════════════
+
+class OddsCache:
+    """
+    Stores the first odds seen for each match across all bookmakers.
+    Once recorded, never updated — these are the "opening odds" for our purposes.
+    """
+    
+    def __init__(self):
+        self.data = {}  # {match_id: {home_team, away_team, sport_key, 
+                        #             first_seen, commence_time, 
+                        #             odds: {outcome: {bookie: price}}}}
+        self._load()
+    
+    def record(self, match: dict):
+        """Record first-seen odds for a match if we haven't seen it before."""
+        mid = match.get('id', '')
+        if not mid or mid in self.data:
+            return False  # Already recorded
+        
+        home = match.get('home_team', '')
+        away = match.get('away_team', '')
+        bookmakers = match.get('bookmakers', [])
+        
+        if len(bookmakers) < MIN_BOOKMAKERS:
+            return False
+        
+        odds = {'home': {}, 'draw': {}, 'away': {}}
+        for bk in bookmakers:
+            name = bk.get('title', '?')
+            for market in bk.get('markets', []):
+                if market.get('key') != 'h2h':
+                    continue
+                for o in market.get('outcomes', []):
+                    p = o.get('price', 0)
+                    if p <= 0:
+                        continue
+                    on = o.get('name', '')
+                    if on == home:
+                        odds['home'][name] = p
+                    elif on == away:
+                        odds['away'][name] = p
+                    elif on == 'Draw':
+                        odds['draw'][name] = p
+        
+        # Only record if we got enough bookmaker data
+        if not odds['home'] and not odds['draw'] and not odds['away']:
+            return False
+        
+        self.data[mid] = {
+            'home_team': home,
+            'away_team': away,
+            'sport_key': match.get('sport_key', ''),
+            'sport_title': match.get('sport_title', ''),
+            'first_seen': datetime.now().isoformat(),
+            'commence_time': match.get('commence_time', ''),
+            'odds': odds,
+        }
+        self._save()
+        return True
+    
+    def get_odds(self, match_id: str, outcome: str) -> dict:
+        """Get first-seen odds for a specific match+outcome. Returns {bookie: price}."""
+        entry = self.data.get(match_id)
+        if not entry:
+            return {}
+        return entry.get('odds', {}).get(outcome, {})
+    
+    def get_match_info(self, match_id: str) -> Optional[dict]:
+        return self.data.get(match_id)
+    
+    def has(self, match_id: str) -> bool:
+        return match_id in self.data
+    
+    def count(self) -> int:
+        return len(self.data)
+    
+    def untraded_matches(self, portfolio) -> list:
+        """Return cached matches that haven't been bet on yet."""
+        bet_ids = {t.match_id for t in portfolio.trades}
+        return [mid for mid in self.data if mid not in bet_ids]
+    
+    def _load(self):
+        if ODDS_CACHE_FILE.exists():
+            try:
+                with open(ODDS_CACHE_FILE) as f:
+                    self.data = json.load(f)
+                print(f"  Loaded {len(self.data)} first-seen odds records")
+            except (json.JSONDecodeError, IOError):
+                self.data = {}
+    
+    def _save(self):
+        with open(ODDS_CACHE_FILE, 'w') as f:
+            json.dump(self.data, f, indent=2)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -93,7 +194,6 @@ class PaperPortfolio:
         self._save_portfolio()
 
     def find_unsettled(self, home: str, away: str) -> list:
-        """Find unsettled trades by team names (case-insensitive partial match)."""
         h, a = home.lower(), away.lower()
         return [t for t in self.trades if not t.settled
                 and (h in t.home_team.lower() or h in t.away_team.lower())
@@ -121,12 +221,13 @@ class PaperPortfolio:
             print(f"  Win rate:  {wins}/{len(settled)} ({wins/len(settled)*100:.1f}%)")
             if total_staked > 0:
                 print(f"  ROI:       {self.total_pnl/total_staked*100:.2f}%")
-
             print(f"\n  Last {min(5, len(settled))} settled:")
             for t in settled[-5:]:
                 sym = "✅" if t.won else "❌"
                 print(f"    {sym} {t.home_team[:20]:20s} vs {t.away_team[:20]:20s} "
                       f"| {t.outcome:5s} @ {t.best_odds:.2f} | £{t.profit:+.2f}")
+        else:
+            print(f"  No settled trades yet")
 
     @property
     def total_pnl(self):
@@ -221,7 +322,7 @@ class OddsAPI:
             with urllib.request.urlopen(req, timeout=15) as r:
                 return json.loads(r.read().decode())
         except urllib.error.HTTPError as e:
-            if e.code not in (422,):  # 422 = sport doesn't support this endpoint
+            if e.code not in (422,):
                 print(f"  ⚠️  API {e.code}: {e.reason}")
             return []
         except Exception as e:
@@ -233,69 +334,86 @@ class OddsAPI:
                           f'&markets=h2h&oddsFormat=decimal')
 
     def get_scores(self, sport_key):
-        """Fetch completed match results from /scores endpoint."""
         return self.fetch(f'{self.base}/sports/{sport_key}/scores'
                           f'?apiKey={self.key}&daysFrom=3')
 
 
 # ═══════════════════════════════════════════════════════════════════
-# STRATEGY
+# STRATEGY — uses FIRST-SEEN odds only
 # ═══════════════════════════════════════════════════════════════════
 
-def scan_value(matches, portfolio):
-    found = []
+def record_new_matches(matches: list, cache: OddsCache):
+    """Record first-seen odds for any new matches."""
+    new = 0
     for m in matches:
-        home, away = m.get('home_team', ''), m.get('away_team', '')
-        mid, sk = m.get('id', ''), m.get('sport_key', '')
-        bookies = m.get('bookmakers', [])
-        if len(bookies) < MIN_BOOKMAKERS:
+        if cache.record(m):
+            new += 1
+    return new
+
+
+def scan_cached_matches(cache: OddsCache, portfolio: PaperPortfolio) -> list:
+    """
+    Scan cached first-seen odds for value bets.
+    Only considers matches we haven't already bet on.
+    """
+    found = []
+    
+    for mid in cache.untraded_matches(portfolio):
+        entry = cache.get_match_info(mid)
+        if not entry:
             continue
-
-        odds = {'home': {}, 'draw': {}, 'away': {}}
-        for bk in bookies:
-            name = bk.get('title', '?')
-            for market in bk.get('markets', []):
-                if market.get('key') != 'h2h':
-                    continue
-                for o in market.get('outcomes', []):
-                    p = o.get('price', 0)
-                    if p <= 0: continue
-                    on = o.get('name', '')
-                    if on == home:   odds['home'][name] = p
-                    elif on == away: odds['away'][name] = p
-                    elif on == 'Draw': odds['draw'][name] = p
-
+        
+        odds = entry.get('odds', {})
+        home = entry['home_team']
+        away = entry['away_team']
+        sport_key = entry.get('sport_key', '')
+        sport_title = entry.get('sport_title', '')
+        commence = entry.get('commence_time', '')
+        
         for outcome in ['home', 'draw', 'away']:
-            lst = list(odds[outcome].values())
-            if len(lst) < MIN_BOOKMAKERS:
+            bookie_odds = odds.get(outcome, {})
+            prices = list(bookie_odds.values())
+            
+            if len(prices) < MIN_BOOKMAKERS:
                 continue
-            consensus = statistics.mean(lst)
-            best = max(lst)
+            
+            consensus = statistics.mean(prices)
+            best = max(prices)
+            
             if best <= consensus:
                 continue
             if not (MIN_ODDS <= best <= MAX_ODDS):
                 continue
+            
             edge = (best / consensus - 1) * 100
             if edge < MIN_EDGE_PCT:
                 continue
-            if any(t.match_id == mid and t.outcome == outcome for t in portfolio.trades):
-                continue
+            
             stake = round(portfolio.equity * STAKE_FRAC, 2)
-            if stake < 1: continue
-            best_bookie = max(odds[outcome], key=odds[outcome].get)
-
+            if stake < 1:
+                continue
+            
+            best_bookie = max(bookie_odds, key=bookie_odds.get)
+            
             t = PaperTrade(
-                timestamp=datetime.now().isoformat(), match_id=mid,
-                sport=m.get('sport_title', ''), league=sk,
-                home_team=home, away_team=away,
-                commence_time=m.get('commence_time', '')[:19],
-                outcome=outcome, consensus_odds=round(consensus, 2),
-                best_odds=round(best, 2), best_bookie=best_bookie,
-                edge_pct=round(edge, 1), n_bookmakers=len(bookies),
+                timestamp=datetime.now().isoformat(),
+                match_id=mid,
+                sport=sport_title,
+                league=sport_key,
+                home_team=home,
+                away_team=away,
+                commence_time=commence[:19],
+                outcome=outcome,
+                consensus_odds=round(consensus, 2),
+                best_odds=round(best, 2),
+                best_bookie=best_bookie,
+                edge_pct=round(edge, 1),
+                n_bookmakers=len(prices),
                 stake=stake,
             )
             portfolio.place_bet(t)
             found.append(t)
+    
     return found
 
 
@@ -308,7 +426,6 @@ def auto_settle(portfolio, api_key):
     api = OddsAPI(api_key)
     settled = []
 
-    # Group by league (sport_key)
     groups = {}
     for t in unsettled:
         sk = t.league if t.league and t.league.startswith('soccer_') else 'soccer'
@@ -323,7 +440,7 @@ def auto_settle(portfolio, api_key):
         for match in results:
             if not match.get('completed') and not match.get('scores'):
                 continue
-            sc = match.get('scores', [])
+            sc = match.get('scores') or []
             ht, at = match.get('home_team', ''), match.get('away_team', '')
             hs, as_ = None, None
             for s in sc:
@@ -350,21 +467,50 @@ def auto_settle(portfolio, api_key):
 
 
 def show_pending(portfolio):
-    """Print unsettled trades in a format the agent can act on."""
     unsettled = [t for t in portfolio.trades if not t.settled]
     if not unsettled:
         print(f"\n  ✅ All trades settled!")
         return
 
     print(f"\n{'─' * 55}")
-    print(f"🔍 {len(unsettled)} PENDING RESULTS — need internet lookup")
+    print(f"🔍 {len(unsettled)} PENDING RESULTS")
     print(f"{'─' * 55}")
     for i, t in enumerate(unsettled, 1):
         print(f"\n  [{i}] {t.home_team} vs {t.away_team}")
         print(f"      Placed: {t.timestamp[:19]}  |  Match: {t.commence_time[:10]}")
         print(f"      Back {t.outcome.upper()} @ {t.best_odds:.2f} ({t.best_bookie})")
         print(f"      Stake: £{t.stake:.2f}  |  Edge: {t.edge_pct:.1f}%")
-        print(f"      → Settle with: --settle \"{t.home_team}\" \"{t.away_team}\" <hscore> <ascore>")
+        print(f"      → python3 paper_trader.py --settle \"{t.home_team}\" \"{t.away_team}\" <hscore> <ascore>")
+    print()
+
+
+def show_odds_cache(cache: OddsCache, portfolio: PaperPortfolio):
+    """Show the first-seen odds cache contents."""
+    bet_ids = {t.match_id for t in portfolio.trades}
+    print(f"\n{'─' * 55}")
+    print(f"📝 FIRST-SEEN ODDS CACHE ({cache.count()} matches)")
+    print(f"{'─' * 55}")
+    
+    # Show matches not yet bet on (awaiting scan)
+    unscanned = [mid for mid in cache.data if mid not in bet_ids]
+    if unscanned:
+        print(f"\n  Unscanned ({len(unscanned)}):")
+        for mid in sorted(unscanned)[:10]:
+            e = cache.data[mid]
+            print(f"    • {e['home_team'][:20]:20s} vs {e['away_team'][:20]:20s} "
+                  f"| {e.get('sport_key','')}")
+        if len(unscanned) > 10:
+            print(f"    ... and {len(unscanned)-10} more")
+    
+    # Show scanned (already bet on)
+    scanned = [mid for mid in cache.data if mid in bet_ids]
+    if scanned:
+        print(f"\n  Scanned ({len(scanned)}):")
+        for mid in sorted(scanned)[:10]:
+            e = cache.data[mid]
+            t = next((t for t in portfolio.trades if t.match_id == mid), None)
+            status = "✅ settled" if t and t.settled else "⏳ pending"
+            print(f"    • {e['home_team'][:20]:20s} vs {e['away_team'][:20]:20s} | {status}")
     print()
 
 
@@ -379,11 +525,12 @@ def main():
         sys.exit(1)
 
     import argparse
-    p = argparse.ArgumentParser(description='Paper Trader — Consensus Strategy')
+    p = argparse.ArgumentParser(description='Paper Trader — Opening Odds Consensus')
     p.add_argument('--watch', action='store_true', help='Continuous polling')
-    p.add_argument('--report', action='store_true', help='Portfolio + pending results')
+    p.add_argument('--report', action='store_true', help='Portfolio + pending')
+    p.add_argument('--odds-cache', action='store_true', help='Show first-seen odds cache')
     p.add_argument('--settle', nargs=4, metavar=('HOME','AWAY','HGOALS','AGOALS'),
-                   help='Settle a trade: --settle "Team A" "Team B" 2 1')
+                   help='Settle: --settle "Team A" "Team B" 2 1')
 
     args = p.parse_args()
 
@@ -392,7 +539,7 @@ def main():
         portfolio = PaperPortfolio()
         matches = portfolio.find_unsettled(home, away)
         if not matches:
-            print(f"  No unsettled trade found for {home} vs {away}")
+            print(f"  No unsettled trade for {home} vs {away}")
             return
         t = matches[0]
         try:
@@ -409,25 +556,33 @@ def main():
         return
 
     portfolio = PaperPortfolio()
+    cache = OddsCache()
 
     if args.report:
         portfolio.summary()
         show_pending(portfolio)
+        show_odds_cache(cache, portfolio)
         return
 
-    # One-shot poll + settle + show pending
+    if args.odds_cache:
+        show_odds_cache(cache, portfolio)
+        return
+
+    # === One-shot poll ===
+    api = OddsAPI(key)
+
+    # 1. Settle finished trades
     n_settled = len(auto_settle(portfolio, key))
     if n_settled:
-        print(f"  Auto-settled {n_settled} trades via API scores\n")
-    else:
-        print(f"  No results to auto-settle via API\n")
+        print(f"  Auto-settled {n_settled} trades\n")
 
-    api = OddsAPI(key)
+    # 2. Poll API for new matches
     print(f"📡 Polling The Odds API...")
     matches = api.get_matches()
     if not matches:
         print("  No matches returned")
     else:
+        # Deduplicate
         seen = set()
         unique = []
         for m in matches:
@@ -436,24 +591,37 @@ def main():
                 seen.add(mid)
                 unique.append(m)
         print(f"  {len(unique)} upcoming matches")
-
-        bets = scan_value(unique, portfolio)
-        if bets:
-            print(f"\n{'─' * 55}")
-            print(f"⚡ {len(bets)} NEW VALUE BET{'S' if len(bets) > 1 else ''}")
-            print(f"{'─' * 55}")
-            for b in bets:
-                print(f"  {b.home_team:22s} vs {b.away_team:22s}")
-                print(f"  Back {b.outcome.upper():5s} @ {b.best_odds:.2f} ({b.best_bookie})")
-                print(f"  Edge: {b.edge_pct:.1f}%  |  Stake: £{b.stake:.2f}  |  "
-                      f"{b.n_bookmakers} bookmakers\n")
+        
+        # Record first-seen odds for any NEW matches
+        new = record_new_matches(unique, cache)
+        if new:
+            print(f"  Recorded first-seen odds for {new} new matches")
         else:
-            print(f"  No value bets found")
+            print(f"  No new matches (cache has {cache.count()} total)")
+
+    # 3. Scan cached matches for value bets (using first-seen odds)
+    print(f"\n🔍 Scanning cached odds for value (odds {MIN_ODDS}-{MAX_ODDS}, edge ≥{MIN_EDGE_PCT}%)...")
+    bets = scan_cached_matches(cache, portfolio)
+    
+    if bets:
+        print(f"\n{'─' * 55}")
+        print(f"⚡ {len(bets)} NEW VALUE BET{'S' if len(bets) > 1 else ''} (from first-seen odds)")
+        print(f"{'─' * 55}")
+        for b in bets:
+            print(f"  {b.home_team:22s} vs {b.away_team:22s}")
+            print(f"  Back {b.outcome.upper():5s} @ {b.best_odds:.2f} ({b.best_bookie})")
+            print(f"  Edge: {b.edge_pct:.1f}%  |  Stake: £{b.stake:.2f}  |  "
+                  f"{b.n_bookmakers} bookmakers\n")
+    else:
+        print(f"  No value bets from cached odds")
+        untraded = len(cache.untraded_matches(portfolio))
+        if untraded:
+            print(f"  ({untraded} cached matches not yet bet on — none met criteria)")
 
     portfolio.summary()
     show_pending(portfolio)
 
-    # If watch mode, loop
+    # === Watch mode ===
     if args.watch:
         print(f"\n👁️  Watch mode: polling every {POLL_INTERVAL}s...")
         poll = 1
@@ -463,15 +631,23 @@ def main():
                 poll += 1
                 now = datetime.now().strftime('%H:%M')
                 print(f"[{now}] Poll #{poll}...")
+                
+                # Settle
                 auto_settle(portfolio, key)
+                
+                # Record new matches only (don't re-scan old ones)
                 m2 = api.get_matches()
                 if m2:
-                    b2 = scan_value(m2, portfolio)
-                    if b2:
-                        print(f"  ⚡ {len(b2)} new bets!")
-                        for b in b2:
-                            print(f"     {b.home_team[:20]:20s} vs {b.away_team[:20]:20s} | "
-                                  f"{b.outcome:5s} @ {b.best_odds:.2f} | edge {b.edge_pct:.1f}%")
+                    new2 = record_new_matches(m2, cache)
+                    if new2:
+                        print(f"  {new2} new matches recorded")
+                        bets2 = scan_cached_matches(cache, portfolio)
+                        if bets2:
+                            print(f"  ⚡ {len(bets2)} new bets from fresh odds!")
+                            for b in bets2:
+                                print(f"     {b.home_team[:20]:20s} vs {b.away_team[:20]:20s} | "
+                                      f"{b.outcome:5s} @ {b.best_odds:.2f}")
+                
                 if poll % 6 == 0:
                     portfolio.summary()
                     show_pending(portfolio)
