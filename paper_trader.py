@@ -101,20 +101,20 @@ class OddsCache:
         odds = {'home': {}, 'draw': {}, 'away': {}}
         for bk in bookmakers:
             name = bk.get('title', '?')
+            taken_first_h2h = False
             for market in bk.get('markets', []):
                 if market.get('key') != 'h2h':
                     continue
+                if taken_first_h2h:
+                    continue  # Only take first h2h market per bookmaker
+                taken_first_h2h = True
                 for o in market.get('outcomes', []):
                     p = o.get('price', 0)
-                    if p <= 0:
-                        continue
+                    if p <= 0: continue
                     on = o.get('name', '')
-                    if on == home:
-                        odds['home'][name] = p
-                    elif on == away:
-                        odds['away'][name] = p
-                    elif on == 'Draw':
-                        odds['draw'][name] = p
+                    if on == home: odds['home'][name] = p
+                    elif on == away: odds['away'][name] = p
+                    elif on == 'Draw': odds['draw'][name] = p
         
         # Only record if we got enough bookmaker data
         if not odds['home'] and not odds['draw'] and not odds['away']:
@@ -334,6 +334,10 @@ class OddsAPI:
                           f'?apiKey={self.key}&regions={regions}'
                           f'&markets=h2h&oddsFormat=decimal')
 
+    def get_all_sports(self):
+        """Fetch all available sports to find active leagues."""
+        return self.fetch(f'{self.base}/sports/?apiKey={self.key}')
+
     def get_scores(self, sport_key):
         return self.fetch(f'{self.base}/sports/{sport_key}/scores'
                           f'?apiKey={self.key}&daysFrom=3')
@@ -433,7 +437,14 @@ def auto_settle(portfolio, api_key):
         groups.setdefault(sk, []).append(t)
 
     for sk, trades in groups.items():
-        results = api.get_scores(sk)
+        # Determine which sport key to use for scores
+        if sk.startswith('tennis_') or sk.startswith('soccer_'):
+            score_sport = sk
+        elif sk == 'tennis':
+            score_sport = 'tennis'
+        else:
+            score_sport = 'soccer'
+        results = api.get_scores(score_sport)
         if not results:
             continue
 
@@ -457,7 +468,11 @@ def auto_settle(portfolio, api_key):
             key = (t.home_team, t.away_team)
             if key in scores_map:
                 hs, as_ = scores_map[key]
-                won = {'home': hs > as_, 'draw': hs == as_, 'away': as_ > hs}[t.outcome]
+                # Tennis: no draws, but handle gracefully
+                if t.sport.startswith('ATP') or t.sport.startswith('WTA') or 'tennis' in t.league:
+                    won = (t.outcome == 'home' and hs > as_) or (t.outcome == 'away' and as_ > hs)
+                else:
+                    won = {'home': hs > as_, 'draw': hs == as_, 'away': as_ > hs}[t.outcome]
                 portfolio.settle(t, won)
                 sym = "✅" if won else "❌"
                 print(f"  {sym} {t.home_team} {hs}-{as_} {t.away_team} → {t.outcome} "
@@ -577,21 +592,28 @@ def main():
     if n_settled:
         print(f"  Auto-settled {n_settled} trades\n")
 
-    # 2. Poll API for new matches
+    # 2. Poll API for new matches (soccer + tennis)
     print(f"📡 Polling The Odds API...")
-    matches = api.get_matches()
-    if not matches:
+    all_matches = []
+    
+    for sport in ['soccer', 'tennis']:
+        m = api.get_matches(sport)
+        if m:
+            all_matches.extend(m)
+            print(f"  {sport}: {len(m)} matches")
+    
+    if not all_matches:
         print("  No matches returned")
     else:
-        # Deduplicate
+        # Deduplicate by match_id
         seen = set()
         unique = []
-        for m in matches:
+        for m in all_matches:
             mid = m.get('id', '')
             if mid not in seen:
                 seen.add(mid)
                 unique.append(m)
-        print(f"  {len(unique)} upcoming matches")
+        print(f"  Total: {len(unique)} unique matches")
         
         # Record first-seen odds for any NEW matches
         new = record_new_matches(unique, cache)
@@ -637,17 +659,18 @@ def main():
                 auto_settle(portfolio, key)
                 
                 # Record new matches only (don't re-scan old ones)
-                m2 = api.get_matches()
-                if m2:
-                    new2 = record_new_matches(m2, cache)
-                    if new2:
-                        print(f"  {new2} new matches recorded")
-                        bets2 = scan_cached_matches(cache, portfolio)
-                        if bets2:
-                            print(f"  ⚡ {len(bets2)} new bets from fresh odds!")
-                            for b in bets2:
-                                print(f"     {b.home_team[:20]:20s} vs {b.away_team[:20]:20s} | "
-                                      f"{b.outcome:5s} @ {b.best_odds:.2f}")
+                for sport in ['soccer', 'tennis']:
+                    m2 = api.get_matches(sport)
+                    if m2:
+                        new2 = record_new_matches(m2, cache)
+                        if new2:
+                            print(f"  {sport}: {new2} new matches recorded")
+                            bets2 = scan_cached_matches(cache, portfolio)
+                            if bets2:
+                                print(f"  ⚡ {len(bets2)} new bets from fresh odds!")
+                                for b in bets2:
+                                    print(f"     {b.home_team[:20]:20s} vs {b.away_team[:20]:20s} | "
+                                          f"{b.outcome:5s} @ {b.best_odds:.2f}")
                 
                 if poll % 6 == 0:
                     portfolio.summary()
