@@ -65,7 +65,7 @@ Simulation + live modes.
 | `consensus.py` | Consensus pricing (closing odds) | Historical sim |
 | `consensus_monitor.py` | Consensus value scanning | Historical + live |
 | `opening_consensus.py` | Consensus pricing (opening odds) | Historical sim |
-| `ts_consensus.py` | Time-series consensus | Historical sim |
+| `ts_consensus.py` | Pre-match odds consensus (t=71), edge ≥8%, odds ≤2.5, £10 flat, pause5L | Historical sim (opt.) |
 | `paper_trader.py` | Live paper trader (Consensus) | Live (requires ODDS_API_KEY) |
 | `run.py` | Asian vs European ML | Historical sim |
 | `scalping.py` | Time-scalping sim | Historical sim |
