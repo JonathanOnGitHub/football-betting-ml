@@ -64,6 +64,7 @@ class PaperTrade:
     edge_pct: float
     n_bookmakers: int
     stake: float
+    point: Optional[float] = None          # Total line for over/under (e.g. 2.5)
     won: Optional[bool] = None
     profit: Optional[float] = None
     settled: bool = False
@@ -99,23 +100,35 @@ class OddsCache:
             return False
         
         odds = {'home': {}, 'draw': {}, 'away': {}}
+        totals = {}  # {point: {'over': {bookie: price}, 'under': {bookie: price}}}
         for bk in bookmakers:
             name = bk.get('title', '?')
             taken_first_h2h = False
             for market in bk.get('markets', []):
-                if market.get('key') != 'h2h':
-                    continue
-                if taken_first_h2h:
-                    continue  # Only take first h2h market per bookmaker
-                taken_first_h2h = True
-                for o in market.get('outcomes', []):
-                    p = o.get('price', 0)
-                    if p <= 0: continue
-                    on = o.get('name', '')
-                    if on == home: odds['home'][name] = p
-                    elif on == away: odds['away'][name] = p
-                    elif on == 'Draw': odds['draw'][name] = p
-        
+                if market.get('key') == 'h2h':
+                    if taken_first_h2h:
+                        continue
+                    taken_first_h2h = True
+                    for o in market.get('outcomes', []):
+                        p = o.get('price', 0)
+                        if p <= 0: continue
+                        on = o.get('name', '')
+                        if on == home: odds['home'][name] = p
+                        elif on == away: odds['away'][name] = p
+                        elif on == 'Draw': odds['draw'][name] = p
+                elif market.get('key') == 'totals':
+                    point = market.get('outcomes', [{}])[0].get('point', 2.5) if market.get('outcomes') else 2.5
+                    if point not in totals:
+                        totals[point] = {'over': {}, 'under': {}}
+                    for o in market.get('outcomes', []):
+                        p = o.get('price', 0)
+                        if p <= 0: continue
+                        on = o.get('name', '').lower()
+                        if 'over' in on:
+                            totals[point]['over'][name] = p
+                        elif 'under' in on:
+                            totals[point]['under'][name] = p
+
         # Only record if we got enough bookmaker data
         if not odds['home'] and not odds['draw'] and not odds['away']:
             return False
@@ -128,6 +141,7 @@ class OddsCache:
             'first_seen': datetime.now().isoformat(),
             'commence_time': match.get('commence_time', ''),
             'odds': odds,
+            'totals': totals,
             'surface': detect_surface(match.get('sport_key', ''), match.get('sport_title', '')),
         }
         self._save()
@@ -251,6 +265,7 @@ class PaperPortfolio:
                     edge_pct=float(row['edge_pct']),
                     n_bookmakers=int(row['n_bookmakers']),
                     stake=float(row['stake']),
+                    point=float(row['point']) if row.get('point', '') else None,
                     won={'True': True, 'False': False, '': None}.get(row.get('won', ''), None),
                     profit=float(row['profit']) if row.get('profit', '') else None,
                     settled=row.get('settled', 'False') == 'True',
@@ -266,7 +281,7 @@ class PaperPortfolio:
     def _append_trade(self, t):
         fn = ['timestamp','match_id','sport','league','home_team','away_team',
               'commence_time','outcome','consensus_odds','best_odds','best_bookie',
-              'edge_pct','n_bookmakers','stake','won','profit','settled']
+              'edge_pct','n_bookmakers','stake','point','won','profit','settled']
         exists = TRADE_LOG.exists()
         with open(TRADE_LOG, 'a', newline='') as f:
             w = csv.DictWriter(f, fieldnames=fn)
@@ -276,7 +291,7 @@ class PaperPortfolio:
     def _save_all_trades(self):
         fn = ['timestamp','match_id','sport','league','home_team','away_team',
               'commence_time','outcome','consensus_odds','best_odds','best_bookie',
-              'edge_pct','n_bookmakers','stake','won','profit','settled']
+              'edge_pct','n_bookmakers','stake','point','won','profit','settled']
         with open(TRADE_LOG, 'w', newline='') as f:
             w = csv.DictWriter(f, fieldnames=fn)
             w.writeheader()
@@ -295,6 +310,7 @@ class PaperPortfolio:
             'edge_pct': f"{t.edge_pct:.1f}",
             'n_bookmakers': str(t.n_bookmakers),
             'stake': f"{t.stake:.2f}",
+            'point': f"{t.point:.1f}" if t.point is not None else '',
             'won': str(t.won) if t.won is not None else '',
             'profit': f"{t.profit:.2f}" if t.profit is not None else '',
             'settled': str(t.settled),
@@ -330,10 +346,10 @@ class OddsAPI:
         except Exception as e:
             return []
 
-    def get_matches(self, sport='soccer', regions='uk,eu'):
+    def get_matches(self, sport='soccer', regions='uk,eu', markets='h2h'):
         return self.fetch(f'{self.base}/sports/{sport}/odds'
                           f'?apiKey={self.key}&regions={regions}'
-                          f'&markets=h2h&oddsFormat=decimal')
+                          f'&markets={markets}&oddsFormat=decimal')
 
     def get_all_sports(self):
         """Fetch all available sports to find active leagues."""
@@ -505,6 +521,83 @@ def scan_cached_matches(cache: OddsCache, portfolio: PaperPortfolio) -> list:
     return found
 
 
+# ═══════════════════════════════════════════════════════════════════
+# OVER/UNDER 2.5 SCANNER
+# ═══════════════════════════════════════════════════════════════════
+
+# From backtest: Over 2.5 only, edge ≥8%, 6+ bookmakers → +13.49% ROI
+OU_MIN_EDGE = 8.0
+OU_MIN_BOOKMAKERS = 6
+OU_MIN_ODDS = 1.3
+OU_MAX_ODDS = 3.0
+OU_POINT = 2.5  # Standard total goals line
+
+
+def scan_totals(cache: OddsCache, portfolio: PaperPortfolio) -> list:
+    """
+    Scan cached first-seen totals (over/under) odds for value bets.
+    Validated for Over 2.5 only at ≥8% edge with 6+ bookmakers.
+    """
+    found = []
+
+    for mid in cache.untraded_matches(portfolio):
+        entry = cache.get_match_info(mid)
+        if not entry:
+            continue
+
+        totals = entry.get('totals', {})
+        if OU_POINT not in totals:
+            continue
+
+        point_data = totals[OU_POINT]
+        home = entry['home_team']
+        away = entry['away_team']
+        sport_key = entry.get('sport_key', '')
+        sport_title = entry.get('sport_title', '')
+        commence = entry.get('commence_time', '')
+
+        # Only soccer has validated over/under data
+        if 'soccer' not in sport_key and 'soccer' not in sport_title.lower():
+            continue
+
+        over_odds = point_data.get('over', {})
+        under_odds = point_data.get('under', {})
+
+        # Check Over 2.5 (validated direction)
+        over_prices = list(over_odds.values())
+        if len(over_prices) >= OU_MIN_BOOKMAKERS:
+            consensus = statistics.mean(over_prices)
+            best = max(over_prices)
+
+            if best > consensus and OU_MIN_ODDS <= best <= OU_MAX_ODDS:
+                edge = (best / consensus - 1) * 100
+                if edge >= OU_MIN_EDGE:
+                    stake = round(portfolio.equity * STAKE_FRAC, 2)
+                    if stake >= 1:
+                        best_bookie = max(over_odds, key=over_odds.get)
+                        t = PaperTrade(
+                            timestamp=datetime.now().isoformat(),
+                            match_id=mid,
+                            sport=f"Over {OU_POINT} - {sport_title}",
+                            league=sport_key,
+                            home_team=home,
+                            away_team=away,
+                            commence_time=commence[:19],
+                            outcome='over_2.5',
+                            consensus_odds=round(consensus, 2),
+                            best_odds=round(best, 2),
+                            best_bookie=best_bookie,
+                            edge_pct=round(edge, 1),
+                            n_bookmakers=len(over_prices),
+                            stake=stake,
+                            point=OU_POINT,
+                        )
+                        portfolio.place_bet(t)
+                        found.append(t)
+
+    return found
+
+
 def auto_settle(portfolio, api_key):
     """Try to settle via The Odds API /scores endpoint."""
     unsettled = [t for t in portfolio.trades if not t.settled]
@@ -551,14 +644,25 @@ def auto_settle(portfolio, api_key):
             key = (t.home_team, t.away_team)
             if key in scores_map:
                 hs, as_ = scores_map[key]
-                # Tennis: no draws, but handle gracefully
-                if t.sport.startswith('ATP') or t.sport.startswith('WTA') or 'tennis' in t.league:
+                # Over/Under settlement
+                if t.outcome == 'over_2.5':
+                    total_goals = hs + as_
+                    point = t.point or 2.5
+                    won = total_goals > point
+                elif t.outcome == 'under_2.5':
+                    total_goals = hs + as_
+                    point = t.point or 2.5
+                    won = total_goals < point
+                # Tennis: no draws
+                elif t.sport.startswith('ATP') or t.sport.startswith('WTA') or 'tennis' in t.league:
                     won = (t.outcome == 'home' and hs > as_) or (t.outcome == 'away' and as_ > hs)
+                # Standard h2h
                 else:
                     won = {'home': hs > as_, 'draw': hs == as_, 'away': as_ > hs}[t.outcome]
                 portfolio.settle(t, won)
                 sym = "✅" if won else "❌"
-                print(f"  {sym} {t.home_team} {hs}-{as_} {t.away_team} → {t.outcome} "
+                detail = f"{hs}-{as_}" if t.outcome in ('over_2.5', 'under_2.5') else f"{hs}-{as_}"
+                print(f"  {sym} {t.home_team} {detail} {t.away_team} → {t.outcome} "
                       f"{'WON' if won else 'LOST'} (£{t.profit:+.2f})")
                 settled.append(t)
 
@@ -575,11 +679,17 @@ def show_pending(portfolio):
     print(f"🔍 {len(unsettled)} PENDING RESULTS")
     print(f"{'─' * 55}")
     for i, t in enumerate(unsettled, 1):
+        if t.outcome in ('over_2.5', 'under_2.5'):
+            direction = f"{'OVER' if 'over' in t.outcome else 'UNDER'} {t.point:.1f}"
+            settle_cmd = f"python3 paper_trader.py --settle \"{t.home_team}\" \"{t.away_team}\" <hscore> <ascore>"
+        else:
+            direction = t.outcome.upper()
+            settle_cmd = f"python3 paper_trader.py --settle \"{t.home_team}\" \"{t.away_team}\" <hscore> <ascore>"
         print(f"\n  [{i}] {t.home_team} vs {t.away_team}")
         print(f"      Placed: {t.timestamp[:19]}  |  Match: {t.commence_time[:10]}")
-        print(f"      Back {t.outcome.upper()} @ {t.best_odds:.2f} ({t.best_bookie})")
+        print(f"      Back {direction} @ {t.best_odds:.2f} ({t.best_bookie})")
         print(f"      Stake: £{t.stake:.2f}  |  Edge: {t.edge_pct:.1f}%")
-        print(f"      → python3 paper_trader.py --settle \"{t.home_team}\" \"{t.away_team}\" <hscore> <ascore>")
+        print(f"      → {settle_cmd}")
     print()
 
 
@@ -646,7 +756,12 @@ def main():
         except ValueError:
             print("  Scores must be integers")
             return
-        won = {'home': hs > as_, 'draw': hs == as_, 'away': as_ > hs}[t.outcome]
+        if t.outcome == 'over_2.5':
+            won = (hs + as_) > (t.point or 2.5)
+        elif t.outcome == 'under_2.5':
+            won = (hs + as_) < (t.point or 2.5)
+        else:
+            won = {'home': hs > as_, 'draw': hs == as_, 'away': as_ > hs}[t.outcome]
         portfolio.settle(t, won)
         sym = "✅" if won else "❌"
         print(f"  {sym} Settled: {t.home_team} {hs}-{as_} {t.away_team} → "
@@ -680,7 +795,8 @@ def main():
     all_matches = []
     
     for sport in ['soccer', 'tennis']:
-        m = api.get_matches(sport)
+        # Request both h2h and totals markets for over/under
+        m = api.get_matches(sport, markets='h2h,totals')
         if m:
             all_matches.extend(m)
             print(f"  {sport}: {len(m)} matches")
@@ -719,10 +835,26 @@ def main():
             print(f"  Edge: {b.edge_pct:.1f}%  |  Stake: £{b.stake:.2f}  |  "
                   f"{b.n_bookmakers} bookmakers\n")
     else:
-        print(f"  No value bets from cached odds")
+        print(f"  No h2h value bets")
+    
+    # 4. Scan for over/under 2.5 value bets
+    print(f"\n🔍 Scanning totals for Over {OU_POINT} value (edge ≥{OU_MIN_EDGE}%, ≥{OU_MIN_BOOKMAKERS} books)...")
+    ou_bets = scan_totals(cache, portfolio)
+    
+    if ou_bets:
+        print(f"\n{'─' * 55}")
+        print(f"⚡ {len(ou_bets)} NEW OVER/UNDER BET{'S' if len(ou_bets) > 1 else ''}")
+        print(f"{'─' * 55}")
+        for b in ou_bets:
+            print(f"  {b.home_team:22s} vs {b.away_team:22s}")
+            print(f"  Back OVER {b.point:.1f} @ {b.best_odds:.2f} ({b.best_bookie})")
+            print(f"  Edge: {b.edge_pct:.1f}%  |  Stake: £{b.stake:.2f}  |  "
+                  f"{b.n_bookmakers} bookmakers\n")
+    else:
+        print(f"  No over/under value bets")
         untraded = len(cache.untraded_matches(portfolio))
         if untraded:
-            print(f"  ({untraded} cached matches not yet bet on — none met criteria)")
+            print(f"  ({untraded} cached matches — none met totals criteria)")
 
     portfolio.summary()
     show_pending(portfolio)
@@ -743,17 +875,23 @@ def main():
                 
                 # Record new matches only (don't re-scan old ones)
                 for sport in ['soccer', 'tennis']:
-                    m2 = api.get_matches(sport)
+                    m2 = api.get_matches(sport, markets='h2h,totals')
                     if m2:
                         new2 = record_new_matches(m2, cache)
                         if new2:
                             print(f"  {sport}: {new2} new matches recorded")
                             bets2 = scan_cached_matches(cache, portfolio)
                             if bets2:
-                                print(f"  ⚡ {len(bets2)} new bets from fresh odds!")
+                                print(f"  ⚡ {len(bets2)} new h2h bets from fresh odds!")
                                 for b in bets2:
                                     print(f"     {b.home_team[:20]:20s} vs {b.away_team[:20]:20s} | "
                                           f"{b.outcome:5s} @ {b.best_odds:.2f}")
+                            ou2 = scan_totals(cache, portfolio)
+                            if ou2:
+                                print(f"  ⚡ {len(ou2)} new over/under bets from fresh odds!")
+                                for b in ou2:
+                                    print(f"     {b.home_team[:20]:20s} vs {b.away_team[:20]:20s} | "
+                                          f"Over {b.point:.1f} @ {b.best_odds:.2f}")
                 
                 if poll % 6 == 0:
                     portfolio.summary()
