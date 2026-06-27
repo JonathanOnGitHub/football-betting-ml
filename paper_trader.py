@@ -128,6 +128,7 @@ class OddsCache:
             'first_seen': datetime.now().isoformat(),
             'commence_time': match.get('commence_time', ''),
             'odds': odds,
+            'surface': detect_surface(match.get('sport_key', ''), match.get('sport_title', '')),
         }
         self._save()
         return True
@@ -344,8 +345,77 @@ class OddsAPI:
 
 
 # ═══════════════════════════════════════════════════════════════════
-# STRATEGY — uses FIRST-SEEN odds only
+# SURFACE DETECTOR — Tennis tournament surface lookup
 # ═══════════════════════════════════════════════════════════════════
+
+# Known tennis tournaments and their surfaces
+# Format: patterns that appear in sport_key or sport_title → surface
+SURFACE_PATTERNS = {
+    'clay': [
+        'french open', 'roland garros', 'monte carlo', 'madrid', 'rome',
+        'barcelona', 'hamburg', 'munich', 'geneva', 'lyon', 'gstaad',
+        'bastad', 'umag', 'kitzbuhel', 'stuttgart', 'rio open',
+        'buenos aires', 'santiago', 'cordoba', 'bogota', 'sao paulo',
+        'marrakech', 'casablanca', 'estoril', 'bucharest', 'belgrade',
+        'paris masters', 'savannah', 'aix en provence', 'heilbronn',
+        'clay', 'red clay',
+    ],
+    'grass': [
+        'wimbledon', 'queen\'s club', 'halle', 'eastbourne',
+        's-hertogenbosch', 'rosmalen', 'mallorca', 'newport',
+        'nottingham', 'grass', 'surbiton', 'stuttgart grass',
+    ],
+    'hard': [
+        'us open', 'australian open', 'indian wells', 'miami',
+        'cincinnati', 'canada masters', 'toronto', 'montreal',
+        'shanghai', 'paris masters indoor', 'beijing', 'tokyo',
+        'vienna', 'basel', 'stockholm', 'antwerp', 'moscow',
+        'washington', 'acapulco', 'dubai', 'doha', 'abu dhabi',
+        'zhuhai', 'chengdu', 'astana', 'sofia', 'marseille',
+        'montpellier', 'milan', 'london', 'hard', 'atp finals',
+    ],
+}
+
+# Which surfaces we should value-bet
+VALIDATED_TENNIS = {
+    'atp': ['clay'],      # ATP clay only
+    'wta': ['hard'],      # WTA hard only
+}
+
+
+def detect_surface(sport_key: str, sport_title: str) -> str:
+    """
+    Detect tennis court surface from sport key and title.
+    Returns 'clay', 'grass', 'hard', or 'unknown'.
+    """
+    text = f"{sport_key.lower()} {sport_title.lower()}"
+    
+    for surface, patterns in SURFACE_PATTERNS.items():
+        for pattern in patterns:
+            if pattern.lower() in text:
+                return surface
+    
+    # Default for ATP/WTA events if nothing matched
+    if 'atp' in text or 'wta' in text:
+        return 'hard'  # Most non-clay/grass ATP/WTA events are hard
+    
+    return 'unknown'
+
+
+def should_bet_tennis(sport_key: str, sport_title: str) -> bool:
+    """
+    Check if a tennis match should be value-bet based on surface + gender.
+    Returns True if this match type is validated.
+    """
+    surface = detect_surface(sport_key, sport_title)
+    text = f"{sport_key.lower()} {sport_title.lower()}"
+    
+    gender = 'atp' if 'atp' in text else 'wta' if 'wta' in text else None
+    if gender is None:
+        return False
+    
+    allowed = VALIDATED_TENNIS.get(gender, [])
+    return surface in allowed
 
 def record_new_matches(matches: list, cache: OddsCache):
     """Record first-seen odds for any new matches."""
@@ -381,6 +451,19 @@ def scan_cached_matches(cache: OddsCache, portfolio: PaperPortfolio) -> list:
             
             if len(prices) < MIN_BOOKMAKERS:
                 continue
+            
+            # Tennis surface filtering
+            if 'tennis' in sport_key or 'tennis' in sport_title.lower():
+                # Skip draws (tennis has no draws)
+                if outcome == 'draw':
+                    continue
+                # Only bet validated tennis surfaces
+                surface = entry.get('surface', 'unknown')
+                text = f"{sport_key.lower()} {sport_title.lower()}"
+                gender = 'atp' if 'atp' in text else 'wta' if 'wta' in text else None
+                allowed = VALIDATED_TENNIS.get(gender, [])
+                if surface not in allowed:
+                    continue
             
             consensus = statistics.mean(prices)
             best = max(prices)
